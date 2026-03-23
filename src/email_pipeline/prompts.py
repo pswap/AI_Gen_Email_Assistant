@@ -77,6 +77,7 @@ Check grammar, tone alignment with the tone spec and intent, and contextual cohe
 
 Set grammar_ok, tone_aligned, context_coherent explicitly.
 Score criteria 0-10: clarity, tone_fit, personalization, goal_alignment, structure, fact_consistency.
+Call out concrete grammar or punctuation issues in fixes when present.
 If blocking_issues exist, pass_=false.
 fix_target: "polish" for light edits; "rewrite_draft" if structure or content must be regenerated.
 

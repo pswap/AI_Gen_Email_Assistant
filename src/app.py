@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
@@ -14,6 +15,13 @@ sys.path.insert(0, str(ROOT))
 from email_pipeline.orchestrator import run_email_pipeline
 from email_pipeline.schemas import UserEmailContext
 
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+
+    PDF_EXPORT_AVAILABLE = True
+except Exception:
+    PDF_EXPORT_AVAILABLE = False
 
 def _prior_messages_from_chat(max_messages: int = 12) -> list[str]:
     out: list[str] = []
@@ -48,6 +56,11 @@ with st.sidebar:
     sender_role = st.text_input("Your role / title")
     company = st.text_input("Company / org")
     product_or_service = st.text_input("Product / service")
+    tone_choice = st.selectbox(
+        "Tone selector",
+        options=["auto", "formal", "friendly", "assertive", "neutral", "casual"],
+        index=0,
+    )
     tone_hint = st.text_input("Tone hint (optional)", placeholder="e.g. professional, friendly")
     length_hint = st.text_input("Length hint (optional)", placeholder="e.g. short, 1 paragraph")
 
@@ -81,6 +94,8 @@ def _build_context() -> UserEmailContext:
     constraints = _split_lines(constraints_text)
 
     # Softly map UI hints into constraints. The intent agent can still override tone.
+    if tone_choice != "auto":
+        constraints.append(f"Tone preference: {tone_choice}")
     if tone_hint.strip():
         constraints.append(f"Tone preference: {tone_hint.strip()}")
     if length_hint.strip():
@@ -98,6 +113,41 @@ def _build_context() -> UserEmailContext:
     )
 
 
+def _make_email_download_text(subject: str, body: str) -> str:
+    return f"Subject: {subject}\n\n{body}\n"
+
+
+def _make_pdf_bytes(subject: str, body: str) -> bytes:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    y = height - 50
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, f"Subject: {subject}")
+    y -= 30
+    c.setFont("Helvetica", 11)
+    for line in body.splitlines():
+        if y < 50:
+            c.showPage()
+            y = height - 50
+            c.setFont("Helvetica", 11)
+        c.drawString(40, y, line[:150])
+        y -= 16
+    c.save()
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _collect_prior_context(max_messages: int = 12, max_edits: int = 8) -> list[str]:
+    context_lines: list[str] = []
+    context_lines.extend(_prior_messages_from_chat(max_messages=max_messages))
+    for edit in st.session_state.get("draft_edit_log", [])[-max_edits:]:
+        context_lines.append(
+            f"edit_feedback: changed subject to '{edit.get('subject','')[:80]}' and updated body."
+        )
+    return context_lines
+
+
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 
@@ -112,6 +162,12 @@ if "pipeline_state" not in st.session_state:
 
 if "last_generated_user_message" not in st.session_state:
     st.session_state.last_generated_user_message = None
+if "latest_subject" not in st.session_state:
+    st.session_state.latest_subject = ""
+if "latest_body" not in st.session_state:
+    st.session_state.latest_body = ""
+if "draft_edit_log" not in st.session_state:
+    st.session_state.draft_edit_log = []
 
 for msg in st.session_state.chat_messages:
     with st.chat_message(msg["role"]):
@@ -130,7 +186,7 @@ if regen:
         model=OPENAI_MODEL,
         user_message=base,
         context=ctx,
-        prior_messages=_prior_messages_from_chat(),
+        prior_messages=_collect_prior_context(),
         max_iterations=3,
         temperature=0.6,
     )
@@ -141,6 +197,8 @@ if regen:
     if result.status == "complete" and result.polished:
         subject = result.polished.subject.strip()
         body = result.polished.body.strip()
+        st.session_state.latest_subject = subject
+        st.session_state.latest_body = body
         assistant_content = f"**Subject:** {subject}\n\n{body}"
     else:
         assistant_content = result.clarifying_question or "Could not generate the email. Please try again."
@@ -170,7 +228,7 @@ if user_text:
                 model=OPENAI_MODEL,
                 user_message=composed_user_message,
                 context=ctx,
-                prior_messages=_prior_messages_from_chat(),
+                prior_messages=_collect_prior_context(),
                 max_iterations=3,
                 temperature=0.3,
             )
@@ -205,6 +263,8 @@ if user_text:
                 if result.polished:
                     subject = result.polished.subject.strip()
                     body = result.polished.body.strip()
+                    st.session_state.latest_subject = subject
+                    st.session_state.latest_body = body
                     assistant_content = f"**Subject:** {subject}\n\n{body}"
                 else:
                     assistant_content = "No email generated. Please try again."
@@ -213,6 +273,51 @@ if user_text:
                 st.session_state.chat_messages.append(
                     {"role": "assistant", "content": assistant_content}
                 )
+
+if st.session_state.latest_subject or st.session_state.latest_body:
+    st.subheader("Email preview and editor")
+    edited_subject = st.text_input("Edit subject", value=st.session_state.latest_subject)
+    edited_body = st.text_area("Edit body", value=st.session_state.latest_body, height=260)
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        if st.button("Save edits"):
+            st.session_state.latest_subject = edited_subject.strip()
+            st.session_state.latest_body = edited_body.strip()
+            st.session_state.draft_edit_log.append(
+                {"subject": st.session_state.latest_subject, "body": st.session_state.latest_body}
+            )
+            st.success("Draft edits saved. Future suggestions will consider these edits.")
+    with col_b:
+        st.download_button(
+            "Export .txt",
+            data=_make_email_download_text(edited_subject, edited_body),
+            file_name="generated_email.txt",
+            mime="text/plain",
+        )
+    with col_c:
+        if PDF_EXPORT_AVAILABLE:
+            st.download_button(
+                "Export PDF",
+                data=_make_pdf_bytes(edited_subject, edited_body),
+                file_name="generated_email.pdf",
+                mime="application/pdf",
+            )
+        else:
+            st.caption("PDF export unavailable (install `reportlab`).")
+
+    st.download_button(
+        "Export .eml",
+        data=(
+            "From: \n"
+            "To: \n"
+            f"Subject: {edited_subject}\n"
+            "Content-Type: text/plain; charset=utf-8\n\n"
+            f"{edited_body}\n"
+        ),
+        file_name="generated_email.eml",
+        mime="message/rfc822",
+    )
 
 
 if st.session_state.pipeline_state and st.session_state.pipeline_state.get("status") == "complete":

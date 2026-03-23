@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from langgraph.graph import END, StateGraph
 from openai import OpenAI
+from typing_extensions import TypedDict
 
 from .agents import (
     DraftWriterAgent,
@@ -23,7 +25,6 @@ from .schemas import (
     ParsedInput,
     PersonalizedEmail,
     ReviewResult,
-    RoutingAction,
     ToneStyleSpec,
     UserEmailContext,
 )
@@ -86,6 +87,19 @@ def _polished_to_draft(p: PersonalizedEmail) -> EmailDraft:
     )
 
 
+class PipelineGraphState(TypedDict):
+    state: EmailPipelineState
+    parsed: Optional[ParsedInput]
+    intent: Optional[IntentClassification]
+    tone: Optional[ToneStyleSpec]
+    context_pack: Optional[ContextPack]
+    draft: Optional[EmailDraft]
+    polished: Optional[PersonalizedEmail]
+    review: Optional[ReviewResult]
+    critic_fixes: List[str]
+    iteration: int
+
+
 def run_email_pipeline(
     *,
     client: OpenAI,
@@ -104,6 +118,8 @@ def run_email_pipeline(
 
     state = EmailPipelineState(user_message=user_message, context=context)
     state.profile_memory = _merge_profile_memory(context)
+    if prior_messages:
+        state.profile_memory["prior_messages"] = prior_messages[-20:]
 
     input_agent = InputParsingAgent(client, model)
     intent_agent = IntentDetectionAgent(client, model)
@@ -113,88 +129,94 @@ def run_email_pipeline(
     review_agent = ReviewValidatorAgent(client, model)
     routing_agent = RoutingMemoryAgent(client, model)
 
-    parsed: ParsedInput = input_agent.run(
-        user_message=user_message,
-        context=context,
-        temperature=temperature,
-    )
-    state.parsed_input = parsed
-    _log(state, "InputParsingAgent", "parsed", parsed.model_dump_json())
+    def parse_input_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = input_agent.run(user_message=user_message, context=context, temperature=temperature)
+        gs["parsed"] = parsed
+        gs["state"].parsed_input = parsed
+        _log(gs["state"], "InputParsingAgent", "parsed", parsed.model_dump_json())
+        return gs
 
-    if not parsed.prompt_valid:
-        summary = {
-            "stage": "after_input_parsing",
-            "prompt_valid": False,
-            "validation_issues": parsed.validation_issues,
-        }
-        routing = routing_agent.run(summary=summary, temperature=0.2)
-        state.routing_decisions.append(routing)
-        _log(state, "RoutingMemoryAgent", routing.action.value, routing.memory_note)
-        state.status = "needs_clarification"
-        state.clarifying_question = (
-            parsed.clarifying_question
-            or "; ".join(parsed.validation_issues)
-            or "Please provide a clearer request for the email you want."
+    def parse_router(gs: PipelineGraphState) -> str:
+        parsed = gs["parsed"]
+        assert parsed is not None
+        if not parsed.prompt_valid or parsed.missing_critical_info:
+            summary = {
+                "stage": "after_input_parsing",
+                "prompt_valid": parsed.prompt_valid,
+                "validation_issues": parsed.validation_issues,
+                "missing_critical_info": parsed.missing_critical_info,
+            }
+            routing = routing_agent.run(summary=summary, temperature=0.2)
+            gs["state"].routing_decisions.append(routing)
+            _log(gs["state"], "RoutingMemoryAgent", routing.action.value, routing.memory_note)
+            gs["state"].status = "needs_clarification"
+            gs["state"].clarifying_question = (
+                parsed.clarifying_question
+                or "; ".join(parsed.validation_issues)
+                or ("To proceed: " + ", ".join(parsed.missing_critical_info[:3]))
+            )
+            return "stop"
+        return "continue"
+
+    def intent_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = gs["parsed"]
+        assert parsed is not None
+        intent = intent_agent.run(
+            user_message=user_message,
+            parsed=parsed,
+            context=context,
+            temperature=temperature,
         )
-        return state
+        gs["intent"] = intent
+        gs["state"].intent_classification = intent
+        _log(gs["state"], "IntentDetectionAgent", intent.intent_category.value, intent.rationale)
+        return gs
 
-    if parsed.missing_critical_info:
-        summary = {
-            "stage": "after_input_parsing",
-            "missing_critical_info": parsed.missing_critical_info,
-        }
-        routing = routing_agent.run(summary=summary, temperature=0.2)
-        state.routing_decisions.append(routing)
-        _log(state, "RoutingMemoryAgent", routing.action.value, routing.memory_note)
-        state.status = "needs_clarification"
-        state.clarifying_question = parsed.clarifying_question or (
-            "To proceed: " + ", ".join(parsed.missing_critical_info[:3])
+    def tone_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = gs["parsed"]
+        intent = gs["intent"]
+        assert parsed is not None and intent is not None
+        context_pack = build_context_pack(parsed, intent, context)
+        gs["context_pack"] = context_pack
+        gs["state"].context_pack = context_pack
+        _log(gs["state"], "Orchestrator", "context_pack", context_pack.model_dump_json())
+
+        tone = tone_agent.run(parsed=parsed, intent=intent, context=context, temperature=temperature)
+        gs["tone"] = tone
+        gs["state"].tone_spec = tone
+        _log(gs["state"], "ToneStylistAgent", tone.target_tone.value, tone.composed_tone_directive[:500])
+        return gs
+
+    def draft_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = gs["parsed"]
+        intent = gs["intent"]
+        tone = gs["tone"]
+        context_pack = gs["context_pack"]
+        assert parsed is not None and intent is not None and tone is not None and context_pack is not None
+
+        draft = draft_agent.run(
+            parsed=parsed,
+            intent=intent,
+            tone=tone,
+            context_pack=context_pack,
+            context=context,
+            revision_fixes=gs.get("critic_fixes") or None,
+            temperature=temperature,
         )
-        return state
+        gs["draft"] = draft
+        gs["state"].draft = draft
+        gs["critic_fixes"] = []
+        _log(gs["state"], "DraftWriterAgent", "draft", f"subject={draft.subject[:80]!r}")
+        return gs
 
-    intent: IntentClassification = intent_agent.run(
-        user_message=user_message,
-        parsed=parsed,
-        context=context,
-        temperature=temperature,
-    )
-    state.intent_classification = intent
-    _log(state, "IntentDetectionAgent", intent.intent_category.value, intent.rationale)
+    def personalize_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = gs["parsed"]
+        intent = gs["intent"]
+        tone = gs["tone"]
+        context_pack = gs["context_pack"]
+        draft = gs["draft"]
+        assert all([parsed, intent, tone, context_pack, draft])
 
-    context_pack = build_context_pack(parsed, intent, context)
-    state.context_pack = context_pack
-    _log(state, "Orchestrator", "context_pack", context_pack.model_dump_json())
-
-    tone: ToneStyleSpec = tone_agent.run(
-        parsed=parsed,
-        intent=intent,
-        context=context,
-        temperature=temperature,
-    )
-    state.tone_spec = tone
-    _log(
-        state,
-        "ToneStylistAgent",
-        tone.target_tone.value,
-        tone.composed_tone_directive[:500],
-    )
-
-    draft = draft_agent.run(
-        parsed=parsed,
-        intent=intent,
-        tone=tone,
-        context_pack=context_pack,
-        context=context,
-        revision_fixes=None,
-        temperature=temperature,
-    )
-    state.draft = draft
-    _log(state, "DraftWriterAgent", "draft", f"subject={draft.subject[:80]!r}")
-
-    critic_fixes: list[str] = []
-    polished: Optional[PersonalizedEmail] = None
-
-    for iteration in range(max_iterations):
         polished = personalize_agent.run(
             draft=draft,
             parsed=parsed,
@@ -203,19 +225,29 @@ def run_email_pipeline(
             context_pack=context_pack,
             context=context,
             prior_messages=prior_messages,
-            refinement_fixes=critic_fixes if critic_fixes else None,
-            profile_memory=state.profile_memory,
+            refinement_fixes=gs.get("critic_fixes") or None,
+            profile_memory=gs["state"].profile_memory,
             temperature=temperature,
         )
-        state.polished = polished
+        gs["polished"] = polished
+        gs["state"].polished = polished
         _log(
-            state,
+            gs["state"],
             "PersonalizationAgent",
-            f"iteration_{iteration}",
+            f"iteration_{gs['iteration']}",
             f"subject={polished.subject[:80]!r}",
         )
+        return gs
 
-        review: ReviewResult = review_agent.run(
+    def review_node(gs: PipelineGraphState) -> PipelineGraphState:
+        parsed = gs["parsed"]
+        intent = gs["intent"]
+        tone = gs["tone"]
+        context_pack = gs["context_pack"]
+        polished = gs["polished"]
+        assert all([parsed, intent, tone, context_pack, polished])
+
+        review = review_agent.run(
             parsed=parsed,
             intent=intent,
             tone=tone,
@@ -223,47 +255,79 @@ def run_email_pipeline(
             polished=polished,
             temperature=0.2,
         )
-        state.review_feedback.append(review)
-        _log(
-            state,
-            "ReviewValidatorAgent",
-            "review",
-            f"pass={review.pass_} score={review.score}",
-        )
+        gs["review"] = review
+        gs["state"].review_feedback.append(review)
+        _log(gs["state"], "ReviewValidatorAgent", "review", f"pass={review.pass_} score={review.score}")
+        return gs
 
+    def review_router(gs: PipelineGraphState) -> str:
+        review = gs["review"]
+        assert review is not None
         if review.pass_:
-            state.status = "complete"
-            summary = {"stage": "review_pass", "score": review.score}
-            routing = routing_agent.run(summary=summary, temperature=0.2)
-            state.routing_decisions.append(routing)
-            _log(state, "RoutingMemoryAgent", routing.action.value, routing.memory_note)
-            return state
+            gs["state"].status = "complete"
+            routing = routing_agent.run(summary={"stage": "review_pass", "score": review.score}, temperature=0.2)
+            gs["state"].routing_decisions.append(routing)
+            _log(gs["state"], "RoutingMemoryAgent", routing.action.value, routing.memory_note)
+            return "done"
 
-        critic_fixes = review.fixes
+        gs["iteration"] += 1
         summary = {
             "stage": "review_fail",
-            "iteration": iteration,
+            "iteration": gs["iteration"],
             "fix_target": review.fix_target.value,
             "blocking_issues": review.blocking_issues,
         }
         routing = routing_agent.run(summary=summary, temperature=0.2)
-        state.routing_decisions.append(routing)
-        _log(state, "RoutingMemoryAgent", routing.action.value, routing.memory_note)
+        gs["state"].routing_decisions.append(routing)
+        _log(gs["state"], "RoutingMemoryAgent", routing.action.value, routing.memory_note)
 
+        if gs["iteration"] >= max_iterations:
+            gs["state"].status = "complete"
+            return "done"
+
+        gs["critic_fixes"] = review.fixes
         if review.fix_target == FixTarget.rewrite_draft:
-            draft = draft_agent.run(
-                parsed=parsed,
-                intent=intent,
-                tone=tone,
-                context_pack=context_pack,
-                context=context,
-                revision_fixes=review.fixes,
-                temperature=temperature,
-            )
-            state.draft = draft
-            critic_fixes = []
-        else:
-            draft = _polished_to_draft(polished)
+            return "rewrite"
+        gs["draft"] = _polished_to_draft(gs["polished"])
+        return "retry_personalize"
 
-    state.status = "complete"
-    return state
+    graph = StateGraph(PipelineGraphState)
+    graph.add_node("parse_input", parse_input_node)
+    graph.add_node("intent", intent_node)
+    graph.add_node("tone", tone_node)
+    graph.add_node("draft", draft_node)
+    graph.add_node("personalize", personalize_node)
+    graph.add_node("review", review_node)
+
+    graph.set_entry_point("parse_input")
+    graph.add_conditional_edges(
+        "parse_input",
+        parse_router,
+        {"continue": "intent", "stop": END},
+    )
+    graph.add_edge("intent", "tone")
+    graph.add_edge("tone", "draft")
+    graph.add_edge("draft", "personalize")
+    graph.add_edge("personalize", "review")
+    graph.add_conditional_edges(
+        "review",
+        review_router,
+        {"done": END, "rewrite": "draft", "retry_personalize": "personalize"},
+    )
+
+    app = graph.compile()
+    final_graph_state = app.invoke(
+        {
+            "state": state,
+            "parsed": None,
+            "intent": None,
+            "tone": None,
+            "context_pack": None,
+            "draft": None,
+            "polished": None,
+            "review": None,
+            "critic_fixes": [],
+            "iteration": 0,
+        }
+    )
+    return final_graph_state["state"]
